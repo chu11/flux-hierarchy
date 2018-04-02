@@ -11,5 +11,5 @@ Usage
 =====
 
 * `flux start src/initial_program hierarchy_config.json root ${NUM_JOBS} ${COMMAND}`
-** The structure of the `hierarchy_config.json` is outlined in an [RFC wiki entry](https://github.com/flux-framework/rfc/wiki/Parent-Child-Communication-Strategies-for-Nested-Flux-Instances#hierarchy-configuration)
+  * The structure of the `hierarchy_config.json` is outlined in an [RFC wiki entry](https://github.com/flux-framework/rfc/wiki/Parent-Child-Communication-Strategies-for-Nested-Flux-Instances#hierarchy-configuration)
 * See `examples/launch.sh` for a functioning example
