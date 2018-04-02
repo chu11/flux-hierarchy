@@ -1,0 +1,13 @@
+{
+    "levels": [
+        {
+            "cores_per_child": 36,
+            "num_children": 2
+        },
+        {
+            "cores_per_child": 1,
+            "num_children": 36
+        }
+    ],
+    "num_levels": 3
+}

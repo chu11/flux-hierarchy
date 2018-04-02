@@ -1,0 +1,523 @@
+#!/usr/bin/env python
+
+import csv
+import time
+import datetime
+import json
+import os
+import signal
+import sys
+import argparse
+import subprocess
+import socket
+import syslog
+import math
+import re
+import multiprocessing as mp
+
+import psutil
+import flux
+from flux import kvs, jsc
+from flux.rpc import RPC
+from flux.core.inner import ffi, raw
+
+ENV_FILTER = re.compile(r"^(SLURM_|FLUX_)")
+def get_environment():
+    env = dict()
+    for key in os.environ:
+        if ENV_FILTER.match(key):
+            continue
+        env[key] = os.environ[key]
+    env.pop('HOSTNAME', None)
+    env.pop('ENVIRONMENT', None)
+    # Make MVAPICH behave...
+    env['MPIRUN_RSH_LAUNCH'] = '1'
+    # Pass some Flux variables through
+    env['FLUX_MODULE_PATH'] = os.environ['FLUX_MODULE_PATH']
+    if 'FLUX_SCHED_RC_NOOP' in os.environ:
+        env['FLUX_SCHED_RC_NOOP'] = os.environ['FLUX_SCHED_RC_NOOP']
+    return env
+
+def build_cmd(args):
+    init_prog_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'initial_program')
+    print "Initial program path: {}".format(init_prog_path)
+    assert os.path.isfile(init_prog_path)
+    flux_cmd = ['flux', 'start']
+    broker_opts = ""
+    init_prog_cmd = [init_prog_path]
+    if args.persist_dir:
+        broker_opts = '-o,-Spersist-filesystem={}'.format(args.persist_dir)
+        if args.debug:
+            broker_opts += ",-Slog-forward-level=7"
+        else:
+            broker_opts += ",-Slog-forward-level=6"
+    args_vars = vars(args)
+    for argument in ['sched_plugin', 'results_dir', 'log_dir', 'persist_dir']:
+        if args_vars[argument]:
+            init_prog_cmd.extend(['--{}'.format(argument), args_vars[argument]])
+    if args.verbose:
+        init_prog_cmd.append('--verbose')
+    if args.debug:
+        init_prog_cmd.append('--debug')
+    init_prog_cmd.extend([args.hierarchy_config_file, 'child', '{}'.format(args.level+1), str(args.full_jobid)]) # '&>', os.path.join(args.log_dir, "{}-stdouterr".format(args.full_jobid))])
+    flux_cmd.append(broker_opts)
+    full_cmd = flux_cmd + init_prog_cmd
+    return full_cmd
+
+def child_spec_generator(hierarchy_config_json, args):
+    if args.num_levels == 1 or args.leaf:
+        return
+    child_cmd = build_cmd(args)
+    print "Full CMD: {}".format(child_cmd)
+    my_childrens_info = hierarchy_config_json['levels'][args.level - 1]
+    ncpus = my_childrens_info['cores_per_child']
+    nnodes = int(math.ceil(ncpus / float(psutil.cpu_count(logical=False))))
+    environ = get_environment()
+    job_spec = {
+        'nnodes': nnodes,
+        'ntasks': ncpus,
+        'cmdline': child_cmd,
+        'environ': environ,
+        'cwd': os.getcwd(),
+        'walltime' : 60 * 60 * 24,
+    }
+    for _ in xrange(my_childrens_info['num_children']):
+        print "Creating childinstance with {} cpus and {} nodes".format(ncpus, nnodes)
+        yield job_spec
+
+def submit_job(flux_handle, job_json_str):
+    resp = flux_handle.rpc_send('job.submit', job_json_str)
+    if resp is None:
+        raise RuntimeError("RPC response invalid")
+    if resp.get('errnum', None) is not None:
+        raise RuntimeError("Job creation failed with error code {}".format(
+            resp['errnum']))
+    job_id = resp['jobid']
+    return job_id
+
+def load_sched_module(args):
+    ''' Load the sched module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sched', 'jobid={}'.format(args.local_jobid)]
+    if args.results_dir:
+        load_cmd.append("resultsfolder={}".format(args.results_dir))
+    if args.sched_plugin:
+        load_cmd.append("plugin={}".format(args.sched_plugin))
+    if args.verbose:
+        load_cmd.append('verbosity={}'.format(1))
+
+    print "Loading sched module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def load_sched_proxy_module(args, hierarchy_config_json):
+    ''' Load the sched proxy c module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sched_proxy',
+                "num_levels={}".format(args.num_levels),
+                "id={}".format(args.full_jobid)]
+
+    if args.root or args.internal:
+        target_num_children = get_target_num_child_instances(hierarchy_config_json, args.level)
+        load_cmd.append("target_num_children={}".format(target_num_children))
+
+    if args.root:
+        load_cmd.append("root=1")
+    elif args.internal:
+        load_cmd.append("internal=1")
+    elif args.leaf:
+        load_cmd.append("leaf=1")
+    else:
+        raise RuntimeError("Unknown position within hierarchy")
+
+    print "Loading sched_proxy module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def print_flux_info(args, flux_handle):
+    ''' Loads the sim module into the enclosing flux instance '''
+
+    print "Hostname: {}".format(socket.gethostname())
+    print "Python interpreter: {}".format(sys.executable)
+    print "Python search path: {}".format(sys.path)
+    getattrs = ['local-uri', 'rank', 'size']
+    for attr in getattrs:
+        cmd = ['flux', 'getattr', attr]
+        output = subprocess.check_output(cmd)
+        if len(output) > 0:
+            print "Flux {}: {}".format(attr, output)
+    cmd = ['flux', 'module', 'list', '--rank=all']
+    output = subprocess.check_output(cmd)
+    if len(output) > 0:
+        print "Flux module info: {}".format(output)
+    ps_process = psutil.Process()
+    print "Flux broker CPU affinity: {}".format(ps_process.cpu_affinity())
+    if args.verbose:
+        xml_dir= kvs.get_dir(flux_handle, "resource.hwloc.xml")
+        for key in xml_dir:
+            print "resource.hwloc.xml.{}: {}".format(key, xml_dir[key])
+
+def check_parent_if_i_should_exit(parent_handle):
+    resp = parent_handle.rpc_send("sched_proxy.should_child_exit")
+    return resp['should_exit']
+
+def get_target_num_child_instances(hierarchy_config_json, hierarchy_level):
+    # hierarchy level is 1-indexed (root == 1)
+    try:
+        num_levels = hierarchy_config_json['num_levels']
+        assert hierarchy_level <= num_levels
+    except AssertionError:
+        print "Level: {}, NumLevels: {}".format(hierarchy_level, num_levels)
+        raise
+
+    if hierarchy_level == num_levels:
+        return 0 # is a leaf, has no children
+    else:
+        return hierarchy_config_json['levels'][hierarchy_level - 1]['num_children']
+
+pending_jobs = []
+running_jobs = []
+completed_jobs = []
+def get_jsc_cb(outstream, hierarchy_config_json, hierarchy_level):
+    fieldnames = ['id', 'nnodes', 'ntasks', 'starting-time', 'complete-time',
+                  'walltime', 'is_hierarchical']
+    if outstream:
+        writer = csv.DictWriter(outstream, fieldnames)
+        writer.writeheader()
+    else:
+        writer = None
+
+    target_num_child_instances = get_target_num_child_instances(hierarchy_config_json, hierarchy_level)
+
+    def jsc_cb(jcb_str, arg, errnum):
+        (flux_handle, args) = arg
+        jcb = json.loads(jcb_str)
+        nstate = jcb[jsc.JSC_STATE_PAIR][jsc.JSC_STATE_PAIR_NSTATE]
+        jobid = jcb['jobid']
+        value = jsc.job_num2state(nstate)
+        print "JSC Event - jobid: {}, value: {}".format(jobid, value)
+        if value == 'submitted':
+            pending_jobs.append(jobid)
+        elif value == 'running':
+            pending_jobs.remove(jobid)
+            running_jobs.append(jobid)
+        elif value == 'complete':
+            print "Job completed: {}".format(jobid)
+            running_jobs.remove(jobid)
+            completed_jobs.append(jobid)
+            jobdir_key = 'lwj.{}'.format(jobid)
+            complete_key = '{}.complete-time'.format(jobdir_key)
+            print "Looking for kvs entry {}, since job {} completed".format(complete_key, jobid)
+            while not kvs.exists(flux_handle, complete_key):
+                print "{} kvs entry not found, waiting for it to be created".format(complete_key)
+                time.sleep(1)
+            job_kvs = kvs.get_dir(flux_handle, jobdir_key)
+            rowdict = {}
+            for key in fieldnames:
+                try:
+                    rowdict[key] = job_kvs[key]
+                except KeyError:
+                    pass
+            rowdict['id'] = jobid
+            if writer:
+                writer.writerow(rowdict)
+            if args.debug:
+                cmd = ['flux', 'wreck' , 'attach', str(jobid)]
+                output = subprocess.check_output(cmd)
+                if len(output) > 0:
+                    print "Job {}'s output:".format(jobid)
+                    print output
+                else:
+                    print "Job {} had no output"
+        if len(completed_jobs) > 0 and len(running_jobs) == 0 and len(pending_jobs) == 0:
+            if should_exit_when_done:
+                print "All children are dead, and I already received the exit event, exiting"
+                flux_handle.reactor_stop(flux_handle.get_reactor())
+            else:
+                print "All children are dead, but I haven't received the exit event"
+    return jsc_cb
+
+def no_new_jobs_cb(flux_handle, watcher, msg, cb_args):
+    print "Received an event that there are no new jobs"
+    #flux_handle.log(syslog.LOG_DEBUG, "Received an event that there are no new jobs")
+    time_dict, args = cb_args
+    time_dict['no_new_jobs_event'] = time.time()
+    dump_time_dict(time_dict, args)
+
+should_exit_when_done = False
+def exit_event_cb(flux_handle, watcher, msg, args):
+    global should_exit_when_done
+    print "Received an exit event"
+    if len(running_jobs) == 0 and len(pending_jobs) == 0:
+        if len(completed_jobs) > 0 or (len(completed_jobs) == 0 and args.leaf):
+            print "Received an event that I should exit and all jobs are done, exiting"
+            flux_handle.reactor_stop(flux_handle.get_reactor())
+        else:
+            print "Received an event that I should exit but not jobs have run yet, waiting"
+            should_exit_when_done = True
+    else:
+        print "Received an event that I should exit, but jobs still running/pending, waiting"
+        should_exit_when_done = True
+
+def child_new_job_cb(in_rpc, arg):
+    print "Child new job callback entered"
+    (flux_handle, parent_handle) = arg
+    response = in_rpc.get()
+    job_spec_str = json.dumps(response.payload)
+    print "Child received a new job"
+    request_work_from_parent(flux_handle, parent_handle)
+    job_id = submit_job(flux_handle, job_spec_str)
+    print "Just submitted job #{}".format(job_id)
+
+def request_work_from_parent(flux_handle, parent_handle):
+    print "child about to request more work"
+    rpc_handle = RPC(parent_handle, 'sched_proxy.need_job')
+    rpc_handle.then(child_new_job_cb, (flux_handle, parent_handle))
+    print "child sent request for more work and registered 'then' cb"
+
+def event_reactor_proc(flux_handle):
+    print "Initial_program: Starting event reactor"
+    profile_logging(flux_handle, "init_prog initialized")
+    if flux_handle.reactor_run(flux_handle.get_reactor(), 0) < 0:
+        flux_handle.fatal_error("event_reactor_proc", "reactor run failed")
+    profile_logging(flux_handle, "init_prog exited reactor")
+    print "Initial_program: Event reactor exited"
+
+class Tee(object):
+    '''
+    Allows for printing to a file and flux's dmesg buffer simultaneously
+    Modeled after the Unix 'tee' comand
+    '''
+    def __init__(self, name, mode, buffering=None, flux_handle=None):
+        self.file = open(name, mode, buffering=buffering)
+        if buffering:
+            self.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering)
+        else:
+            self.stdout = sys.stdout
+        self.flux_handle = flux_handle
+        sys.stdout = self
+    def __del__(self):
+        sys.stdout = self.stdout
+        self.file.close()
+    def write(self, data):
+        self.file.write(data)
+        if self.flux_handle:
+            new_data = data.strip()
+            if len(new_data) > 0:
+                self.flux_handle.log(syslog.LOG_DEBUG, new_data)
+    def flush(self):
+        self.file.flush()
+
+def profile_logging(flux_handle, msg):
+    print "{} {}: PROFILE - {}".format(
+        datetime.datetime.utcnow().isoformat(), time.time(), msg)
+    flux_handle.log(syslog.LOG_INFO, "PROFILE - {}".format(msg))
+
+def setup_logging(args, flux_handle=None):
+    '''
+    Replace sys.stdout with an instance of Tee
+    Also set the enclosing broker to write out its logs to a file
+    '''
+    if args.log_dir:
+        filename = os.path.join(args.log_dir, "{}-initprog-pid{}.out".format(args.full_jobid, os.getpid()))
+        Tee(filename, 'w', buffering=0, flux_handle=flux_handle)
+        if flux_handle:
+            flux_handle.log_set_appname("init_prog")
+    else:
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
+
+    if args.log_dir:
+        log_filename = os.path.join(args.log_dir, "{}-broker.out".format(args.full_jobid))
+        setattr_cmd = ['flux', 'setattr', 'log-filename', log_filename]
+        subprocess.check_output(setattr_cmd)
+
+def load_modules(args, hierarchy_config_json):
+    print "Loading modules"
+    load_sched_module(args)
+    load_sched_proxy_module(args, hierarchy_config_json)
+
+def dump_time_dict(time_dict, args):
+    if args.results_dir:
+        with open(os.path.join(args.results_dir, "init_prog.timer"), 'w') as time_outfile:
+            json.dump(time_dict, time_outfile)
+
+def submit_jobs_to_proxy(args, flux_handle=None):
+    if flux_handle is None:
+        flux_handle = flux.Flux()
+
+    command = args.command
+    environ = get_environment()
+    job_spec = {
+        'nnodes': 1,
+        'ntasks': 1,
+        'cmdline': command,
+        'environ': environ,
+        'cwd': os.getcwd(),
+        'walltime' : 60 * 60 * 24,
+    }
+    num_jobs = args.num_jobs
+    for idx in xrange(1, num_jobs+1):
+        profile_logging(flux_handle, "submitting job")
+        resp = flux_handle.rpc_send('sched_proxy.new_job', json.dumps(job_spec))
+        jobid = resp['jobid']
+        print "Just submitted job #{} ({} of {}) to sched_proxy".format(jobid, idx, num_jobs)
+    profile_logging(flux_handle, "no_new_jobs event")
+    flux_handle.event_send('no_new_jobs')
+
+def root_process(flux_handle, hierarchy_config_json, args, init_prog_start_time=None):
+    print "Root node within hierarchy"
+
+    # Create a dictionary of our application's timings, which we will
+    # serialize out to a json file later
+    if init_prog_start_time is None:
+        init_prog_start_time = time.time()
+    time_dict = {'init_prog_start' : init_prog_start_time}
+
+    dump_time_dict(time_dict, args)
+    print "Subscribing to no_new_jobs"
+    flux_handle.event_subscribe("no_new_jobs")
+    no_new_jobs_watcher = flux_handle.msg_watcher_create(no_new_jobs_cb,
+                                                         type_mask=raw.FLUX_MSGTYPE_EVENT,
+                                                         topic_glob="no_new_jobs",
+                                                         args=(time_dict, args))
+    no_new_jobs_watcher.start()
+
+    load_modules(args, hierarchy_config_json)
+
+    # Begin launching the scheduler hierarchy
+    child_specs = list(child_spec_generator(hierarchy_config_json, args))
+    for child_spec in child_specs:
+        child_id = submit_job(flux_handle, child_spec)
+        print "Just submitted child #{}".format(child_id)
+    profile_logging(flux_handle, "all children submitted")
+
+    # Time to begin submitting jobs through the hierarchy
+    submit_jobs_to_proxy(args, flux_handle=flux_handle)
+
+    event_reactor_proc(flux_handle)
+
+    time_dict['init_prog_end'] = time.time()
+    dump_time_dict(time_dict, args)
+
+def child_process(flux_handle, hierarchy_config_json, args):
+    print "Child node within hierarchy"
+    if args.leaf:
+        print "Leaf node within hierarchy"
+    elif args.internal:
+        print "Internal node within hierarchy"
+
+    load_modules(args, hierarchy_config_json)
+
+    for child_spec in child_spec_generator(hierarchy_config_json, args):
+        child_id = submit_job(flux_handle, child_spec)
+        print "Just submitted child #{}".format(child_id)
+    profile_logging(flux_handle, "all children submitted")
+
+    event_reactor_proc(flux_handle)
+
+def main():
+    init_prog_start_time = time.time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('hierarchy_config_file')
+    parser.add_argument('--sched_plugin', help="which sched plugin to use")
+    parser.add_argument('--results_dir', help="directory to store timing and sched results")
+    parser.add_argument('--log_dir', help="directory to store broker and initial program logs")
+    parser.add_argument('--persist_dir', help="directory to use for Flux's persistance directory")
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--debug', '-d', action='store_true')
+
+    subparsers = parser.add_subparsers()
+
+    root_parser = subparsers.add_parser('root')
+    root_parser.set_defaults(root=True, child=False,
+                             prefix=None, level=1)
+    root_parser.add_argument('num_jobs', type=int, help="Number of jobs to create and submit to the hierarchy")
+    root_parser.add_argument('command', nargs="+", help="Command (and arguments) to submit to the hierarchy")
+
+    child_parser = subparsers.add_parser('child')
+    child_parser.set_defaults(child=True, root=False)
+    # can probably be calculated from prefix, but i'm in a hurry and don't want a subtle bug
+    child_parser.add_argument('level', type=int, help="what level in the hierarchy (should be > 1)")
+    child_parser.add_argument('prefix',
+                            help="name prefix, not including the id of "
+                            "this job (e.g. 4.2.5)")
+
+    args = parser.parse_args()
+
+    if args.root:
+        args.local_jobid = "0"
+        args.full_jobid = "0"
+        args.level = 1
+    else:
+        assert args.level > 1
+        args.local_jobid = str(int(os.environ['FLUX_JOB_ID']))
+        args.full_jobid = "{}.{}".format(args.prefix, args.local_jobid)
+
+    assert os.path.isfile(args.hierarchy_config_file)
+    if args.child and args.prefix:
+        for prefix_id in args.prefix.split('.'):
+            assert prefix_id.isdigit()
+
+    with open(args.hierarchy_config_file, 'r') as config_file:
+        hierarchy_config_json = json.load(config_file)
+
+    args.num_levels = hierarchy_config_json['num_levels']
+    assert args.level <= args.num_levels
+    if args.root:
+        args.internal = False
+        args.leaf = False
+    elif args.child:
+        if args.level < args.num_levels:
+            args.internal = True
+            args.leaf = False
+        elif args.level == args.num_levels:
+            args.leaf = True
+            args.internal = False
+
+    for directory in [args.log_dir, args.results_dir, args.persist_dir]:
+        if directory:
+            assert os.path.isdir(directory)
+
+    flux_handle = flux.Flux()
+    setup_logging(args, flux_handle)
+    flux_handle.log(syslog.LOG_INFO,
+                    "PROFILE - init_prog attached to Flux, started at {}".format(init_prog_start_time))
+    print_flux_info(args, flux_handle)
+    if args.debug:
+        print "Running in debug mode"
+
+
+    print "Registering callback with JSC"
+    if args.results_dir:
+        outfilename = os.path.join(args.results_dir, "job-{}".format(args.full_jobid))
+        outfile = open(outfilename, 'wb', 0)
+    jsc_cb_fn = get_jsc_cb(outfile, hierarchy_config_json, args.level)
+    jsc.notify_status(flux_handle, jsc_cb_fn, (flux_handle, args))
+
+    print "Subscribing to init_prog.exit"
+    flux_handle.event_subscribe("init_prog.exit")
+    exit_event_watcher = flux_handle.msg_watcher_create(exit_event_cb,
+                                                        type_mask=raw.FLUX_MSGTYPE_EVENT,
+                                                        topic_glob="init_prog.exit",
+                                                        args=args)
+    exit_event_watcher.start()
+
+    try:
+        if args.root:
+            root_process(flux_handle, hierarchy_config_json, args, init_prog_start_time)
+        elif args.child:
+            child_process(flux_handle, hierarchy_config_json, args)
+    except Exception as e:
+        print e
+        sys.stdout.flush()
+        raise
+
+    if outfile:
+        outfile.close()
+
+    profile_logging(flux_handle, "init_prog exiting")
+
+if __name__ == "__main__":
+    main()
